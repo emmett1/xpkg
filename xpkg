@@ -1,0 +1,229 @@
+#!/bin/bash
+
+pkg_build() {
+	needarg $@
+	while [ $1 ]; do
+		case $1 in
+			-i|-u) ;;
+			-*) PKGMK_CMD+=($1);;
+			*) pkg=$1;;
+		esac
+		shift
+	done
+	
+	if pkg_path $pkg >/dev/null; then
+		cd $(pkg_path $pkg) &>/dev/null
+		pkgmk ${PKGMK_CMD[@]} || exit $?
+		cd - &>/dev/null
+	fi
+}
+
+pkg_install() {
+	needarg $@
+	while [ $1 ]; do
+		case $1 in
+			-i|-u) ;;
+			-t) TESTMODE=1 ;;
+			-*) PKGMK_CMD+=($1);;
+			*) PKG+=($1);;
+		esac
+		shift
+	done
+	
+	if [ "$UID" != 0 ] && [ "$TESTMODE" != 1 ]; then
+		echo "root access needed to install packages."
+		return 1
+	fi
+	
+	if [[ "${PKG[@]}" = "" ]]; then
+		echo "Please provide port name to install."
+		exit 1
+	fi
+	
+	for p in ${PKG[@]}; do
+		isinstalled $p && echo "Package '$p' is installed." || PPKG+=($p)
+	done
+	
+	pkg=$(quick=1 pkg_deplist ${PPKG[@]})
+	
+	for p in $pkg; do
+		if pkg_path $p >/dev/null; then
+			if [ "$TESTMODE" = 1 ]; then
+				echo "Installing $p..."
+			else
+				cd $(pkg_path $p) &>/dev/null
+				[ -e pre-install ] && sh pre-install
+				pkgmk ${PKGMK_CMD[@]} -i -d || return $?
+				[ -e post-install ] && sh post-install
+				cd - &>/dev/null
+			fi
+		else
+			if [ "$TESTMODE" = 1 ]; then
+				echo "Skipping $p..."
+			fi
+		fi
+	done
+}
+
+pkg_path() {
+	needarg $@
+	local pkg=$1
+	for c in $PORT; do
+		if [ -f $c/$pkg/Pkgfile ]; then
+			echo $c/$pkg
+			return 0
+		fi
+	done
+	return 1
+}
+
+pkg_search() {
+	needarg $@
+	local pattern=$1
+	[ "$pattern" ] || return 1
+	find $PORT -type d \
+	| awk -F '/' '{print $NF}' \
+	| grep $pattern \
+	| sort \
+	| uniq \
+	| while read line; do echo -ne "$line "; awk -F "=" '/^version=/{print $2}' $(pkg_path $line)/Pkgfile | head -n1; done
+}
+
+pkg_depends() {
+	needarg $@
+	local pkg=$1
+	ppath=$(pkg_path $pkg) || return 1
+	grep "^# Depends on[[:blank:]]*:" $ppath/Pkgfile \
+	| sed 's/^# Depends on[[:blank:]]*:[[:blank:]]*//' \
+	| tr ' ' '\n' \
+	| awk '!a[$0]++' \
+	| sed 's/,//'
+}
+
+isinstalled() {
+	if [ "$(awk -v p="$1" -v RS="" '$1==p' /var/lib/pkg/db | head -n1)" = "" ]; then
+		return 1
+	fi
+	return 0
+}
+
+deplist() {
+	# check currently process package for loop
+	if [ ${#CHECK[@]} -gt 0 ]; then
+		if [[ "$(echo ${CHECK[@]} | tr " " "\n" | grep -x $1)" == "$1" ]]; then
+			return 0
+		fi
+	fi
+	
+	# add package to currently process
+	CHECK+=($1)
+	
+	# check dependencies
+	for i in $(pkg_depends $1); do
+		if [ "$quick" = 1 ] && isinstalled $i; then
+			continue
+		else
+			if [[ $(echo ${DEP[@]} | tr " " "\n" | grep -x $i) = "" ]]; then
+				deplist $i
+			fi
+		fi
+	done
+	
+	# add dependency to list checked dep
+	if [[ $(echo ${DEP[@]} | tr " " "\n" | grep -x $1) = "" ]]; then
+		DEP+=($1)
+	fi
+	
+	# delete process package array
+	for i in "${!CHECK[@]}"; do
+		if [[ ${CHECK[i]} = "$1" ]]; then
+			unset 'CHECK[i]'
+		fi
+	done
+}
+
+pkg_deplist() {
+	needarg $@
+	while [ "$1" ]; do
+		deplist $1
+		shift
+	done
+	
+	if [ "$quick" = 1 ]; then
+		echo ${DEP[@]} | tr ' ' '\n'
+	else
+		for p in ${DEP[@]}; do
+			if isinstalled $p; then
+				echo "[*] $p"
+			else
+				if pkg_path $p >/dev/null; then
+					echo "[-] $p"
+				else
+					echo "[m] $p"
+				fi
+			fi
+		done
+	fi
+}
+
+pkg_cat() {
+	needarg $@
+	local pkg=$1
+	ppath=$(pkg_path $pkg) || return 1
+	cat $ppath/Pkgfile
+}
+
+pkg_info() {
+	needarg $@
+	local pkg=$1
+	ppath=$(pkg_path $pkg) || return 1
+	
+	. $ppath/Pkgfile
+	desc=$(grep "^# Description[[:blank:]]*:" $ppath/Pkgfile | sed 's/^# Description[[:blank:]]*:[[:blank:]]*//')
+	url=$(grep "^# URL[[:blank:]]*:" $ppath/Pkgfile | sed 's/^# URL[[:blank:]]*:[[:blank:]]*//')
+	maint=$(grep "^# Maintainer[[:blank:]]*:" $ppath/Pkgfile | sed 's/^# Maintainer[[:blank:]]*:[[:blank:]]*//')
+	deps=$(pkg_depends $pkg | tr '\n' ' ')
+	
+	echo -e "Name:         $pkg"
+	echo -e "Path:         $ppath"
+	echo -e "Version:      $version"
+	echo -e "Release:      $release"
+	echo -e "Description:  $desc"
+	echo -e "URL:          $url"
+	echo -e "Maintainer:   $maint"
+	echo -e "Dependencies: $deps"
+}
+	
+needarg() {
+	[ "$*" ] && return 0
+	echo "This mode need arguments."
+	exit 1
+}
+
+trap "exit 1" SIGHUP SIGINT SIGQUIT SIGTERM
+
+REPO_FILE="/etc/xpkg.conf"
+
+if [ ! -f "$REPO_FILE" ]; then
+	msgerr "repo file not exist. ($REPO_FILE)"
+	exit 1
+else
+	while read -r item value junk; do
+		case $item in
+			""|"#"*) continue ;;
+			portdir) PORT+=" $value"
+		esac
+	done < "$REPO_FILE"
+fi
+	
+case $1 in
+	install|path|search|depends|build|deplist|cat|info) mode=$1;;
+	*) echo "invalid mode!"
+		exit 1;;
+esac
+
+shift
+
+pkg_${mode} $@
+
+exit $?
