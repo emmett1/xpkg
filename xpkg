@@ -23,6 +23,7 @@ pkg_install() {
 	while [ $1 ]; do
 		case $1 in
 			-i|-u) ;;
+			-nd) NODEP=1 ;;
 			-t) TESTMODE=1 ;;
 			-*) PKGMK_CMD+=($1);;
 			*) PKG+=($1);;
@@ -41,10 +42,22 @@ pkg_install() {
 	fi
 	
 	for p in ${PKG[@]}; do
-		isinstalled $p && echo "Package '$p' is installed." || PPKG+=($p)
+		if isinstalled $p; then
+			echo "Port '$p' is installed."
+		elif [ "$(pkg_path $p)" = "" ]; then
+			echo "Port '$p' not found."
+		else
+			PPKG+=($p)
+		fi
 	done
 	
-	pkg=$(quick=1 pkg_deplist ${PPKG[@]})
+	[ "${#PPKG[@]}" -eq 0 ] && return 0
+	
+	if [ "$NODEP" = 1 ]; then
+		pkg=${PPKG[@]}
+	else
+		pkg=$(quick=1 pkg_deplist ${PPKG[@]})
+	fi
 	
 	for p in $pkg; do
 		if pkg_path $p >/dev/null; then
@@ -86,7 +99,11 @@ pkg_search() {
 	| grep $pattern \
 	| sort \
 	| uniq \
-	| while read line; do echo -ne "$line "; awk -F "=" '/^version=/{print $2}' $(pkg_path $line)/Pkgfile | head -n1; done
+	| while read line; do
+		isinstalled $line && echo -ne "[*]" || echo -ne "[ ]"
+		echo -ne " $line "
+		awk -F "=" '/^version=/{print $2}' $(pkg_path $line)/Pkgfile | head -n1
+	done
 }
 
 pkg_depends() {
@@ -193,6 +210,83 @@ pkg_info() {
 	echo -e "Maintainer:   $maint"
 	echo -e "Dependencies: $deps"
 }
+
+pkg_update() {
+	while [ "$1" ]; do
+		case $1 in
+			-t) TESTMODE=1;;
+			-nd) NODEP=1;;
+			-*) PKGMK_CMD+=($1);;
+			*) PKG+=($1)
+		esac
+		shift
+	done
+	
+	if [ "$UID" != 0 ] && [ "$TESTMODE" != 1 ]; then
+		echo "root access needed to update packages."
+		return 1
+	fi
+	
+	for p in ${PKG[@]}; do
+		if ! isinstalled $p; then
+			echo "Port '$p' is not installed."
+		else
+			PPKG+=($p)
+		fi
+	done
+	
+	if [ "${#PKG[@]}" -gt 0 ] || [ "${#PPKG[@]}" -gt 0 ]; then
+		UPKG=${PPKG[@]}
+	else
+		UPKG=$(pkg_diff -q)
+	fi
+	
+	if [ "${#UPKG[@]}" -gt 0 ]; then
+		if [ "$NODEP" != 1 ]; then
+			upkg=$(quick=1 pkg_deplist ${UPKG[@]})
+		else
+			upkg=${UPKG[@]}
+		fi
+		for p in $upkg; do
+			if pkg_path $p >/dev/null; then
+				if [ "$TESTMODE" = 1 ]; then
+					echo "Updating $p..."
+				else
+					cd $(pkg_path $p) &>/dev/null
+					pkgmk ${PKGMK_CMD[@]} -u -d || return $?
+					cd - &>/dev/null
+				fi
+			else
+				if [ "$TESTMODE" = 1 ]; then
+					echo "Skipping $p..."
+				fi
+			fi
+		done
+	else
+		echo "Nothing to update."
+	fi
+}			
+
+pkg_diff() {
+	while [ "$1" ]; do
+		case $1 in
+			-q|--quick) QUICK=1;;
+		esac
+		shift
+	done
+	
+	pkginfo -i | while read -r pkg ver; do
+		. $(pkg_path $pkg)/Pkgfile 2>/dev/null
+		if [ "$version" ] && [ "$ver" != "${version}-${release}" ]; then
+			if [ "$QUICK" = 1 ]; then
+				echo "$pkg"
+			else
+				echo "$pkg $ver ==> $pkg ${version}-${release}"
+			fi
+		fi
+		unset version release ver
+	done
+}
 	
 needarg() {
 	[ "$*" ] && return 0
@@ -215,14 +309,19 @@ else
 		esac
 	done < "$REPO_FILE"
 fi
-	
-case $1 in
-	install|path|search|depends|build|deplist|cat|info) mode=$1;;
-	*) echo "invalid mode!"
-		exit 1;;
-esac
 
-shift
+if [ -z "$1" ]; then
+	echo "Run '$(basename $0) help' for more information."
+	exit 0
+else
+	if [ "$(type -t pkg_$1)" = function ]; then
+		mode=$1
+		shift
+	else
+		echo "Invalid mode. ($1)"
+		exit 1
+	fi
+fi
 
 pkg_${mode} $@
 
