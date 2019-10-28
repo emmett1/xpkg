@@ -56,7 +56,7 @@ pkg_install() {
 	if [ "$NODEP" = 1 ]; then
 		pkg=${PPKG[@]}
 	else
-		pkg=$(quick=1 pkg_deplist ${PPKG[@]})
+		pkg=$(pkg_deplist -q ${PPKG[@]})
 	fi
 	
 	for p in $pkg; do
@@ -141,7 +141,11 @@ deplist() {
 			continue
 		else
 			if [[ $(echo ${DEP[@]} | tr " " "\n" | grep -x $i) = "" ]]; then
-				deplist $i
+				if ! pkg_path $i >/dev/null; then
+					MISSINGDEP+=("$i($1)")
+				else
+					deplist $i
+				fi
 			fi
 		fi
 	done
@@ -162,9 +166,21 @@ deplist() {
 pkg_deplist() {
 	needarg $@
 	while [ "$1" ]; do
-		deplist $1
+		case $1 in
+			-q) quick=1;;
+			-*) ;;
+			*) PKG+=($1);;
+		esac
 		shift
 	done
+	
+	if [ "${#PKG[@]}" -gt 0 ]; then
+		for p in ${PKG[@]}; do
+			deplist $p
+		done
+	else
+		return 1
+	fi
 	
 	if [ "$quick" = 1 ]; then
 		echo ${DEP[@]} | tr ' ' '\n'
@@ -173,13 +189,14 @@ pkg_deplist() {
 			if isinstalled $p; then
 				echo "[*] $p"
 			else
-				if pkg_path $p >/dev/null; then
-					echo "[-] $p"
-				else
-					echo "[m] $p"
-				fi
+				echo "[-] $p"
 			fi
 		done
+		if [ "${#MISSINGDEP[@]}" -gt 0 ]; then
+			for m in ${MISSINGDEP[@]}; do
+				echo "Missing deps: $m" | sed 's/(/ (/'
+			done
+		fi
 	fi
 }
 
@@ -243,7 +260,7 @@ pkg_update() {
 	
 	if [ "${#UPKG[@]}" -gt 0 ]; then
 		if [ "$NODEP" != 1 ]; then
-			upkg=$(quick=1 pkg_deplist ${UPKG[@]})
+			upkg=$(pkg_deplist -q ${UPKG[@]})
 		else
 			upkg=${UPKG[@]}
 		fi
