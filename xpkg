@@ -267,11 +267,19 @@ pkg_update() {
 		for p in $upkg; do
 			if pkg_path $p >/dev/null; then
 				if [ "$TESTMODE" = 1 ]; then
-					echo "Updating $p..."
+					isinstalled $p && echo "Updating $p..." || echo "Installing $p..."
 				else
-					cd $(pkg_path $p) &>/dev/null
-					pkgmk ${PKGMK_CMD[@]} -u -d || return $?
-					cd - &>/dev/null
+					if isinstalled $p; then
+						cd $(pkg_path $p) &>/dev/null
+						pkgmk ${PKGMK_CMD[@]} -u -d || return $?
+						cd - &>/dev/null
+					else
+						cd $(pkg_path $p) &>/dev/null
+						[ -e pre-install ] && sh pre-install
+						pkgmk ${PKGMK_CMD[@]} -i -d || return $?
+						[ -e post-install ] && sh post-install
+						cd - &>/dev/null
+					fi
 				fi
 			else
 				if [ "$TESTMODE" = 1 ]; then
