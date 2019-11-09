@@ -1,127 +1,21 @@
 #!/bin/bash
 
-pkg_build() {
-	needarg $@
-	while [ $1 ]; do
-		case $1 in
-			-i|-u) ;;
-			-*) PKGMK_CMD+=($1);;
-			*) pkg=$1;;
-		esac
-		shift
-	done
-	
-	if pkg_path $pkg >/dev/null; then
-		cd $(pkg_path $pkg) &>/dev/null
-		pkgmk ${PKGMK_CMD[@]} || exit $?
-		cd - &>/dev/null
-	fi
-}
-
-pkg_install() {
-	needarg $@
-	while [ $1 ]; do
-		case $1 in
-			-i|-u) ;;
-			-nd) NODEP=1 ;;
-			-t) TESTMODE=1 ;;
-			-*) PKGMK_CMD+=($1);;
-			*) PKG+=($1);;
-		esac
-		shift
-	done
-	
-	if [ "$UID" != 0 ] && [ "$TESTMODE" != 1 ]; then
-		echo "root access needed to install packages."
-		return 1
-	fi
-	
-	if [[ "${PKG[@]}" = "" ]]; then
-		echo "Please provide port name to install."
-		exit 1
-	fi
-	
-	for p in ${PKG[@]}; do
-		if isinstalled $p; then
-			echo "Port '$p' is installed."
-		elif [ "$(pkg_path $p)" = "" ]; then
-			echo "Port '$p' not found."
-		else
-			PPKG+=($p)
-		fi
-	done
-	
-	[ "${#PPKG[@]}" -eq 0 ] && return 0
-	
-	if [ "$NODEP" = 1 ]; then
-		pkg=${PPKG[@]}
-	else
-		pkg=$(pkg_deplist -q ${PPKG[@]})
-	fi
-	
-	for p in $pkg; do
-		if pkg_path $p >/dev/null; then
-			if [ "$TESTMODE" = 1 ]; then
-				echo "Installing $p..."
-			else
-				cd $(pkg_path $p) &>/dev/null
-				[ -e pre-install ] && sh pre-install
-				pkgmk ${PKGMK_CMD[@]} -i -d || return $?
-				[ -e post-install ] && sh post-install
-				cd - &>/dev/null
-			fi
-		else
-			if [ "$TESTMODE" = 1 ]; then
-				echo "Skipping $p..."
-			fi
-		fi
-	done
-}
-
-pkg_path() {
-	needarg $@
-	local pkg=$1
-	for c in $PORT; do
-		if [ -f $c/$pkg/Pkgfile ]; then
-			echo $c/$pkg
-			return 0
-		fi
-	done
-	return 1
-}
-
-pkg_search() {
-	needarg $@
-	local pattern=$1
-	[ "$pattern" ] || return 1
-	find $PORT -type d \
-	| awk -F '/' '{print $NF}' \
-	| grep $pattern \
-	| sort \
-	| uniq \
-	| while read line; do
-		isinstalled $line && echo -ne "[*]" || echo -ne "[ ]"
-		echo -ne " $line "
-		awk -F "=" '/^version=/{print $2}' $(pkg_path $line)/Pkgfile | head -n1
-	done
-}
-
-pkg_depends() {
-	needarg $@
-	local pkg=$1
-	ppath=$(pkg_path $pkg) || return 1
-	grep "^# Depends on[[:blank:]]*:" $ppath/Pkgfile \
-	| sed 's/^# Depends on[[:blank:]]*:[[:blank:]]*//' \
-	| tr ' ' '\n' \
-	| awk '!a[$0]++' \
-	| sed 's/,//'
-}
-
 isinstalled() {
-	if [ "$(awk -v p="$1" -v RS="" '$1==p' /var/lib/pkg/db | head -n1)" = "" ]; then
+	if [ "$(awk -v p="$1" -v RS="" '$1==p' "$PKG_DB" | head -n1)" = "" ]; then
 		return 1
 	fi
 	return 0
+}
+
+needroot() {	
+	if [ $UID != 0 ]; then
+		if [ "$#" -eq 0 ]; then
+			needroot "This operation"
+		else
+			echo "$* need root access!"
+		fi
+		exit 1
+	fi	
 }
 
 deplist() {
@@ -161,6 +55,135 @@ deplist() {
 			unset 'CHECK[i]'
 		fi
 	done
+}
+
+pkg_build() {
+	needarg $@
+	while [ $1 ]; do
+		case $1 in
+			-i|-u) ;;
+			-*) PKGMK_CMD+=($1);;
+			*) pkg=$1;;
+		esac
+		shift
+	done
+	
+	if pkg_path $pkg >/dev/null; then
+		cd $(pkg_path $pkg) &>/dev/null
+		pkgmk ${PKGMK_CMD[@]} || exit $?
+		cd - &>/dev/null
+	fi
+}
+
+pkg_install() {
+	needarg $@
+	while [ $1 ]; do
+		case $1 in
+			-i|-u) ;;
+			-nd) NODEP=1 ;;
+			-t) TESTMODE=1 ;;
+			-*) PKGMK_CMD+=($1);;
+			*) PKG+=($1);;
+		esac
+		shift
+	done
+	
+	if [ "$TESTMODE" != 1 ]; then
+		needroot
+	fi
+	
+	if [[ "${PKG[@]}" = "" ]]; then
+		echo "Please provide port name to install."
+		exit 1
+	fi
+	
+	for p in ${PKG[@]}; do
+		if isinstalled $p; then
+			echo "Port '$p' is installed."
+		elif [ "$(pkg_path $p)" = "" ]; then
+			echo "Port '$p' not found."
+		else
+			PPKG+=($p)
+		fi
+	done
+	
+	[ "${#PPKG[@]}" -eq 0 ] && return 0
+	
+	if [ "$NODEP" = 1 ]; then
+		pkg=${PPKG[@]}
+	else
+		pkg=$(pkg_deplist -q ${PPKG[@]})
+	fi
+	
+	error=0
+	for p in $pkg; do
+		if pkg_path $p >/dev/null; then
+			if [ "$TESTMODE" = 1 ]; then
+				echo "Installing $p..."
+			else
+				cd $(pkg_path $p) &>/dev/null
+				[ -e pre-install ] && sh pre-install
+				pkgmk ${PKGMK_CMD[@]} -i -d
+				if [ $? = 0 ]; then
+					pkg_done+=($p)
+				else
+					error=1
+					break
+				fi
+				[ -e post-install ] && sh post-install
+				cd - &>/dev/null
+			fi
+		else
+			if [ "$TESTMODE" = 1 ]; then
+				echo "Skipping $p..."
+			fi
+		fi
+	done
+	
+	if [ ${#pkg_done[@]} -gt 0 ]; then
+		pkg_trigger ${pkg_done[@]}
+	fi
+	
+	return $error
+}
+
+pkg_path() {
+	needarg $@
+	local pkg=$1
+	for c in $PORT; do
+		if [ -f $c/$pkg/Pkgfile ]; then
+			echo $c/$pkg
+			return 0
+		fi
+	done
+	return 1
+}
+
+pkg_search() {
+	needarg $@
+	local pattern=$1
+	[ "$pattern" ] || return 1
+	find $PORT -type d \
+	| awk -F '/' '{print $NF}' \
+	| grep $pattern \
+	| sort \
+	| uniq \
+	| while read line; do
+		isinstalled $line && echo -ne "[*]" || echo -ne "[ ]"
+		echo -ne " $line "
+		awk -F "=" '/^version=/{print $2}' $(pkg_path $line)/Pkgfile | head -n1
+	done
+}
+
+pkg_depends() {
+	needarg $@
+	local pkg=$1
+	ppath=$(pkg_path $pkg) || return 1
+	grep "^# Depends on[[:blank:]]*:" $ppath/Pkgfile \
+	| sed 's/^# Depends on[[:blank:]]*:[[:blank:]]*//' \
+	| tr ' ' '\n' \
+	| awk '!a[$0]++' \
+	| sed 's/,//'
 }
 
 pkg_deplist() {
@@ -228,6 +251,23 @@ pkg_info() {
 	echo -e "Dependencies: $deps"
 }
 
+pkg_listorphan() {
+	local pkg dep
+	tmpallpkg=$(mktemp)
+	tmpalldep=$(mktemp)
+	for pkg in $(pkginfo -i | awk '{print $1}'); do
+		echo $pkg >> $tmpallpkg
+		dep="$dep $(pkg_depends $pkg)"
+	done
+	echo $dep | tr ' ' '\n' | sort | uniq > $tmpalldep
+	grep -xvF -f $tmpalldep $tmpallpkg
+	rm $tmpalldep $tmpallpkg
+}
+
+pkg_listport() {
+	grep -RE ^name=[0-9a-z]+ ${PORT[@]} | awk -F = '{print $2}' | sort | uniq
+}
+	
 pkg_update() {
 	while [ "$1" ]; do
 		case $1 in
@@ -239,9 +279,8 @@ pkg_update() {
 		shift
 	done
 	
-	if [ "$UID" != 0 ] && [ "$TESTMODE" != 1 ]; then
-		echo "root access needed to update packages."
-		return 1
+	if [ "$TESTMODE" != 1 ]; then
+		needroot
 	fi
 	
 	for p in ${PKG[@]}; do
@@ -264,6 +303,7 @@ pkg_update() {
 		else
 			upkg=${UPKG[@]}
 		fi
+		error=0
 		for p in $upkg; do
 			if pkg_path $p >/dev/null; then
 				if [ "$TESTMODE" = 1 ]; then
@@ -271,12 +311,24 @@ pkg_update() {
 				else
 					if isinstalled $p; then
 						cd $(pkg_path $p) &>/dev/null
-						pkgmk ${PKGMK_CMD[@]} -u -d || return $?
+						pkgmk ${PKGMK_CMD[@]} -u -d
+						if [ $? = 0 ]; then
+							pkg_done+=($p)
+						else
+							error=$?
+							break
+						fi
 						cd - &>/dev/null
 					else
 						cd $(pkg_path $p) &>/dev/null
 						[ -e pre-install ] && sh pre-install
-						pkgmk ${PKGMK_CMD[@]} -i -d || return $?
+						pkgmk ${PKGMK_CMD[@]} -i -d
+						if [ $? = 0 ]; then
+							pkg_done+=($p)
+						else
+							error=$?
+							break
+						fi
 						[ -e post-install ] && sh post-install
 						cd - &>/dev/null
 					fi
@@ -290,6 +342,12 @@ pkg_update() {
 	else
 		echo "Nothing to update."
 	fi
+	
+	if [ ${#pkg_done[@]} -gt 0 ]; then
+		pkg_trigger ${pkg_done[@]}
+	fi
+	
+	return $error
 }			
 
 pkg_diff() {
@@ -312,6 +370,227 @@ pkg_diff() {
 		unset version release ver
 	done
 }
+
+pkg_trigger() {
+	#needroot "Run trigger"
+	if [[ -z "$@" ]]; then
+		for i in trig_{1..12}; do
+			eval $i=1
+		done
+	else
+		pre_triggers $@
+	fi
+	post_triggers
+}
+
+post_triggers() {	
+	if [ "$trig_11" = 1 ] && [ $(type -p fc-cache) ]; then
+		echo "trigger: Updating fontconfig cache..."
+		fc-cache -s
+	fi
+	
+	if [ "$trig_10" = 1 ] && [ $(type -p gdk-pixbuf-query-loaders) ]; then
+		echo "trigger: Probing GDK-Pixbuf loader modules..."
+		gdk-pixbuf-query-loaders --update-cache
+	fi
+	
+	if [ "$trig_9" = 1 ] && [ $(type -p gio-querymodules) ]; then
+		echo "trigger: Updating GIO module cache..."
+		gio-querymodules /usr/lib/gio/modules
+	fi
+	
+	if [ "$trig_8" = 1 ] && [ $(type -p glib-compile-schemas) ]; then
+		echo "trigger: Compiling GSettings XML schema files..."
+		glib-compile-schemas /usr/share/glib-2.0/schemas
+	fi
+	
+	if [ "$trig_7" = 1 ] && [ $(type -p gtk-query-immodules-2.0) ]; then
+		echo "trigger: Probing GTK2 input method modules..."
+		gtk-query-immodules-2.0 --update-cache
+	fi
+	
+	if [ "$trig_6" = 1 ] && [ $(type -p gtk-query-immodules-3.0) ]; then
+		echo "trigger: Probing GTK3 input method modules..."
+		gtk-query-immodules-3.0 --update-cache
+	fi
+	
+	if [ "$trig_5" = 1 ] && [ $(type -p gtk-update-icon-cache) ]; then
+		echo "trigger: Updating icon theme caches..."
+		for dir in /usr/share/icons/* ; do
+			if [[ -e $dir/index.theme ]]; then
+				gtk-update-icon-cache -q $dir &>/dev/null
+			else
+				rm -f $dir/icon-theme.cache
+				rmdir --ignore-fail-on-non-empty $dir
+			fi
+		done
+	fi
+	
+	if [ "$trig_4" = 1 ] && [ $(type -p udevadm) ]; then
+		echo "trigger: Updating hardware database..."
+		udevadm hwdb --update
+	fi
+	
+	if [ "$trig_3" = 1 ] && [ $(type -p mkfontdir) ] && [ $(type -p mkfontscale) ]; then
+		echo "trigger: Updating X fontdir indices..."
+		for dir in $(find /usr/share/fonts -maxdepth 1 -type d \( ! -path /usr/share/fonts -a ! -name X11 \)) /usr/share/fonts/X11/*; do
+			rm -f $dir/fonts.{scale,dir} $dir/.uuid
+			rmdir --ignore-fail-on-non-empty $dir
+			[[ -d $dir ]] || continue
+			mkfontdir $dir
+			mkfontscale $dir
+		done
+	fi
+	
+	if [ "$trig_2" = 1 ] && [ $(type -p update-desktop-database) ]; then
+		echo "trigger: Updating desktop file MIME type cache..."
+		update-desktop-database --quiet
+	fi
+	
+	if [ "$trig_1" = 1 ] && [ $(type -p update-mime-database) ]; then
+		echo "trigger: Updating the MIME type database..."
+		update-mime-database /usr/share/mime
+	fi
+}
+
+pre_triggers() {
+	local pkg
+	
+	# mime db
+	if [ "$trig_1" != "1" ]; then
+		for pkg in $@; do
+			if isinstalled $pkg && [ "$(pkg_files $pkg | grep ^usr/share/mime/$)" ]; then
+				trig_1=1
+				break
+			fi
+		done
+	fi
+	
+	# desktop db
+	if [ "$trig_2" != "1" ]; then
+		for pkg in $@; do
+			if isinstalled $pkg && [ "$(pkg_files $pkg | grep ^usr/share/applications/$)" ]; then
+				trig_2=1
+				break
+			fi
+		done
+	fi
+	
+	# mkfontdir
+	if [ "$trig_3" != "1" ]; then
+		for pkg in $@; do
+			if isinstalled $pkg && [ "$(pkg_files $pkg | grep ^usr/share/fonts/[^/]*/$)" ]; then
+				trig_3=1
+				break
+			fi
+		done
+	fi
+	
+	# hwdb
+	if [ "$trig_4" != "1" ]; then
+		for pkg in $@; do
+			if isinstalled $pkg && [ "$(pkg_files $pkg | grep ^etc/udev/hwdb.d/$)" ]; then
+				trig_4=1
+				break
+			fi
+		done
+	fi
+	
+	# desktop db
+	if [ "$trig_2" != "1" ]; then
+		for pkg in $@; do
+			if isinstalled $pkg && [ "$(pkg_files $pkg | grep ^usr/share/applications/$)" ]; then
+				trig_2=1
+				break
+			fi
+		done
+	fi
+	
+	# mkfontdir
+	if [ "$trig_3" != "1" ]; then
+		for pkg in $@; do
+			if isinstalled $pkg && [ "$(pkg_files $pkg | grep ^usr/share/fonts/[^/]*/$)" ]; then
+				trig_3=1
+				break
+			fi
+		done
+	fi
+	
+	# icon caches
+	if [ "$trig_5" != "1" ]; then
+		for pkg in $@; do
+			if isinstalled $pkg && [ "$(pkg_files $pkg | grep ^usr/share/icons/[^/]*/$)" ]; then
+				trig_5=1
+				break
+			fi
+		done
+	fi
+	
+	# gtk3 immodules
+	if [ "$trig_6" != "1" ]; then
+		for pkg in $@; do
+			if isinstalled $pkg && [ "$(pkg_files $pkg | grep ^usr/lib/gtk-3.0/3.0.0/immodules/.*.so)" ]; then
+				trig_6=1
+				break
+			fi
+		done
+	fi
+	
+	# gtk2 immodules
+	if [ "$trig_7" != "1" ]; then
+		for pkg in $@; do
+			if isinstalled $pkg && [ "$(pkg_files $pkg | grep ^usr/lib/gtk-2.0/2.10.0/immodules/.*.so)" ]; then
+				trig_7=1
+				break
+			fi
+		done
+	fi
+	
+	# gsettings schema
+	if [ "$trig_8" != "1" ]; then
+		for pkg in $@; do
+			if isinstalled $pkg && [ "$(pkg_files $pkg | grep ^usr/share/glib-2.0/schemas/$)" ]; then
+				trig_8=1
+				break
+			fi
+		done
+	fi
+	
+	# gio modules
+	if [ "$trig_9" != "1" ]; then
+		for pkg in $@; do
+			if isinstalled $pkg && [ "$(pkg_files $pkg | grep ^usr/lib/gio/modules/.*.so)" ]; then
+				trig_9=1
+				break
+			fi
+		done
+	fi
+	
+	# gdk-pixbuf
+	if [ "$trig_10" != "1" ]; then
+		for pkg in $@; do
+			if isinstalled $pkg && [ "$(pkg_files $pkg | grep ^usr/lib/gdk-pixbuf-2.0/2.10.0/loaders/.*.so)" ]; then
+				trig_10=1
+				break
+			fi
+		done
+	fi
+	
+	# font caches
+	if [ "$trig_11" != "1" ]; then
+		for pkg in $@; do
+			if isinstalled $pkg && [ "$(pkg_files $pkg | grep ^usr/share/fonts/[^/]*/$)" ]; then
+				trig_11=1
+				break
+			fi
+		done
+	fi
+}
+
+pkg_files() {
+	needarg $@
+	awk -v p="$1" -v RS="" '$1==p' "$PKG_DB" | tail +3
+}
 	
 needarg() {
 	[ "$*" ] && return 0
@@ -322,6 +601,7 @@ needarg() {
 trap "exit 1" SIGHUP SIGINT SIGQUIT SIGTERM
 
 REPO_FILE="/etc/xpkg.conf"
+PKG_DB="/var/lib/pkg/db"
 
 if [ ! -f "$REPO_FILE" ]; then
 	msgerr "repo file not exist. ($REPO_FILE)"
